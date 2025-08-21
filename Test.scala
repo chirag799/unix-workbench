@@ -1,11 +1,9 @@
-package com.citi.purgeFramework.utils
 
+package com.citi.purgeFramework.utils
 import com.citi.audit._
-import com.citi.purgeFramework.driver.Driver.{audit_config, audit_int_flg, audit_param_dict, logger}
-import com.citi.purgeFramework.utils.AuditIntegration.getAuditConfigDetails
+import com.citi.purgeFramework.driver.Driver.{audit_config, audit_param_dict}
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import com.fasterxml.jackson.databind.{DeserializationFeature, JsonNode, ObjectMapper}
-import com.typesafe.config.ConfigException.Missing
 import com.typesafe.config.{Config, ConfigFactory}
 import org.apache.commons.text.StringEscapeUtils
 import org.apache.spark.sql.execution.datasources.json.JsonUtils
@@ -20,140 +18,184 @@ import org.apache.log4j.Logger
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.functions._
 
-import java.text.SimpleDateFormat
 
-object AuditCall extends AppLogger {
+object AuditIntegration extends AppLogger {
+  var autosys_job_name = ""
+  var trace_uuid=""
+  def setReqAuditDetails(spark: SparkSession , appId:String): Unit = {
 
-  def main(sparkargs: Array[String]): Unit = {
+    // "minimal_details" is JSON which contains - autosys job name, trce_uuid, pipelineid,stdout file and stderr file
+    val minimal_details = sys.env.getOrElse("minimal_details", "")
+    val mapper = new ObjectMapper()
+    val actualObj = mapper.readTree(minimal_details)
+    autosys_job_name = actualObj.get("Autosys_job_name").asText
+    trace_uuid = actualObj.get("uuid").asText
 
-    //try {
-      val onlyAuditCall = true
-      val processDate: String = new SimpleDateFormat("yyyyMMdd").format(java.util.Calendar.getInstance().getTime)
-      println("sparkargs: " + sparkargs.toList)
-      val spark_args = sparkargs.map(_.split("=") match { case Array(x, y) => (x, y) }).toMap
-      val user_config = ConfigFactory.parseFile(new File(spark_args("user_config").split("/").last))
-      val env = spark_args("env") //Execution environment. Ex: Dev/uat/prod
+    System.setProperty("logger_autosys_job_name", autosys_job_name)
+    System.setProperty("logger_uuid", trace_uuid)
+    System.setProperty("logger_appid", appId)
 
-      var err_mail_sub = try { user_config.getString("mail_config.err_mail_sub")} catch { case _: Missing => "" }
-      val sent_to = user_config.getString("mail_config.send_to_".concat(env))
-      var Input_Table_query = user_config.getString("Input.Input_table")
-      var reference_table = user_config.getString("Input.Reference_table")
-      var runAtATime = user_config.getString("Input.runAtATime")
-      val Log_table_query = user_config.getString("Input.Log_table_query")
-      var Customer_ID = user_config.getString("Input.Customer_Identification")
-      var LKP_CUSTOMER_ID = user_config.getString("Input.LKP_CUSTOMER_ID")
-      val LOG_table = user_config.getString("Input.LOG_table")
-      var Join_Query = user_config.getString("Input.Join_Query")
-      val extra_cols = try {
-        user_config.getString("Input.extra_cols")
-      } catch {
-        case _: Exception =>
-          ""
-      }
+    // Initialize MDC context once for the entire application
+    setMDCContext(spark)
 
-      var Reference_Query = user_config.getString("Input.Reference_Query")
+  }
 
-      var hdfs_for_temp_data = user_config.getString("log_paths.hdfs_path_for_temp_data")
-      val Reconciliation_table = user_config.getString("Input.Reconciliation_table")
-      var Input_table_bkp_path = user_config.getString("Input.Input_table_bkp_path")
-      var jobApplicationName = user_config.getString("spark.jobApplicationName")
+  def getAuditConfigDetails(user_config: String): String = {
 
-      val purge_status_table = "gcganamrswp_work.ccpa_purge_status"
-      val purge_mode=spark_args("purge_mode")
-      val CSI_ID=spark_args("CSI_ID")
-      val ARG_GROUP_ID=spark_args("ARG_GROUP_ID")
-      val ARG_TYPE_OF_PURGE=spark_args("ARG_TYPE_OF_PURGE")
-      val ARG_PARTITION_NAME=spark_args("ARG_PARTITION_NAME")
-      val LKP_DB_NAME=spark_args("LKP_DB_NAME")
-      val LKP_TABLE_NAME=spark_args("LKP_TABLE_NAME")
+    var audit_int_flg = "true"
+    val sndEmail = new SendEmail
 
 
-      //val ARG_CUSTOMER_ID=${ARG_CUSTOMER_ID}
-      val ARG_AGING=spark_args("ARG_AGING")
-      val increment_column=spark_args("increment_column")
-      val increment_datatype=spark_args("increment_datatype")
-      val TARGET_TABLE_DATE_FORMAT=spark_args("ARG_TARGET_TABLE_DATE_FORMAT")
-      val LH_IND=spark_args("LH_IND")
+    // read the audit user config tag from dq user config.
+    /*var audit_config = try {
+     user_config.getString("Datalens_Integration_Details.Datalens_user_config_".concat(env))
+   } catch {
+     case _: Exception => ""
+   }*/
 
-      val purge_date=spark_args("purge_date")
-      val column_mapping=user_config.getString("Input.Column_mapping").split(",")
-      var lits_override = try { spark_args("lits_override")} catch { case exception: Exception => "false" }
-
-
-      val Identifier_Type = spark_args("Identifier_Type")
-      val exit_code = spark_args("exit_code")
-      val err_msg = spark_args("err_msg")
-      val exit_status:String = if (exit_code.toInt == 0) "SUCCESS" else "FAILURE"
-
-      // reading values from config file
-      logger.info("Getting conf values from local file")
-      //auditFrameworkConfig = conf.getString("auditFrameworkConfig").trim.split("/").last
-      val spark = SparkSession.builder.appName(jobApplicationName)
-        .config("spark.sql.autoBroadcastJoinThreshold","-1")
-        .config("spark.default.parallelism","1")
-        .config("spark.sql.shuffle.partitions","1")
-        .enableHiveSupport()
-        .getOrCreate()
-
-    var Input_Table = "<ARG_DB_NAME>.<ARG_TABLE_NAME>"
-
-    for ((k, v) <- spark_args) {
-      Input_Table_query = Input_Table_query.replaceAll("<" + k + ">", v)
-      Input_Table = Input_Table.replaceAll("<" + k + ">", v)
-      reference_table = reference_table.replaceAll("<" + k + ">", v)
-      Customer_ID = Customer_ID.replaceAll("<" + k + ">", v)
-      LKP_CUSTOMER_ID = LKP_CUSTOMER_ID.replaceAll("<" + k + ">", v)
-      jobApplicationName = jobApplicationName.replaceAll("<" + k + ">", v)
-      err_mail_sub = err_mail_sub.replaceAll("<" + k + ">", v)
-      Input_table_bkp_path = Input_table_bkp_path.replaceAll("<" + k + ">", v)
-      hdfs_for_temp_data = hdfs_for_temp_data.replaceAll("<" + k + ">", v)
-      runAtATime = runAtATime.replaceAll("<" + k + ">", v)
+    logger.info("Audit config name: " + audit_config)
+    audit_param_dict = audit_param_dict + ("audit_config" -> audit_config)
+    if (audit_config != "") {
+      AuditIntegration.audit_start_call("false")
     }
+    else {
+      audit_int_flg = "false"
+      logger.info("Datalens integration flag in DQ user config file is true but Datalens user config file is not present")
+    }
+    return audit_int_flg
 
-      audit_param_dict = audit_param_dict + ("spark" -> spark, "appId" -> spark.sparkContext.applicationId, "sc" -> spark.sparkContext)
+  }
 
+  def audit_start_call(minimal_integration_flag: String): Unit = {
+    logger.info("Before audit start call")
+    /* Access the Map from QualityCheckMain class. In this Map all key value are present that are req to make audit first and final call
+      keys present is DataCheckImplementation.audit_param_dict Map =>
+      audit_req_param("audit_config"),
+      audit_req_param("env"),
+      audit_req_param("dq_error_sent_to"),
+      audit_req_param("framework_config")
+     */
+    try {
 
-      var audit_int_flg = try {
-        user_config.getString("Datalens_Integration_Details.Datalens_Integration_Flag").toLowerCase
-      } catch {
-        case _: Exception =>
-          "false"
+      // Get the framework config and cast it to config to get the required field values from it
+
+      val spark = audit_param_dict.getOrElse("spark", null).asInstanceOf[SparkSession]
+
+      var param_dict = scala.collection.immutable.Map[String, Any]()
+      var mapping_keys = scala.collection.immutable.Map[String, String]().empty
+      param_dict = Map("edge_node_user_config_file" -> audit_param_dict.getOrElse("audit_config","").toString,
+        "env" -> audit_param_dict("env").toString,
+        "audit_email" -> audit_param_dict("sent_to").toString,
+        "spark" -> spark
+      )
+      if(minimal_integration_flag == "true") {
+        val minimal_details = sys.env.getOrElse("minimal_details", "")
+        logger.info("minimal_details: " + minimal_details)
+        val mapper = new ObjectMapper()
+        val actualObj = mapper.readTree(minimal_details)
+        //need to check with paras
+        param_dict += ("minimal_integ_val" -> Map("Autosys_job_name" -> actualObj.get("Autosys_job_name").asText()))
+
+        mapping_keys += (
+          "logFileStderr" -> actualObj.get("logFileStderr").asText(),
+          "logFileStdout" -> actualObj.get("logFileStdout").asText(),
+          "jobExecType" -> "Purge")
+      } else {
+        param_dict += ("minimal_integ_val" -> Map("job_exec_type" -> "Purge"))
       }
-       if (audit_int_flg == "true") {
-         audit_config = if (user_config.hasPath("Datalens_Integration_Details.Datalens_user_config_".concat(env))) {
-          user_config.getString("Datalens_Integration_Details.Datalens_user_config_".concat(env))
-        } else if (user_config.hasPath("Datalens_Integration_Details.Datalens_user_config")) {
-          user_config.getString("Datalens_Integration_Details.Datalens_user_config")
-        } else {
-          ""
+      //val mapping_keys = Map[String, String]().empty
+      logger.info("Param dict in start call: "+param_dict.mkString)
+      AuditFrameworkDriver.startJob(param_dict, mapping_keys,minimal_integration_flag)
+      logger.info("After audit start call ")
+    }
+    catch {
+      case e: Exception =>
+        val writer = new StringWriter();
+        e.printStackTrace(new PrintWriter(writer));
+        val stackTrace = writer.toString();
+        logger.error("Error occurred while making audit start call from DQFIRST EXCEPTION1: "+ stackTrace)
+    }
+  }
+
+
+  def audit_final_call(exit_code: String, job_status: String, error_str: String, e: Throwable = null): Unit = {
+    logger.info("Before audit final call")
+    // Befor making audit final call some more key value pairs has been added which are req for making final call
+    // Now keys present are
+    /*
+    audit_req_param("audit_config"),
+    audit_req_param("env"),
+    audit_req_param("dq_error_sent_to"),
+    audit_req_param("framework_config")
+    audit_req_param("appId")
+    audit_req_param("spark")
+    audit_req_param("sc")
+     */
+    try {
+      var error_msg = "" // occured while executing DQ. Please check yarn logs"
+      if (e != null) {
+        var writer = new StringWriter();
+        e.printStackTrace(new PrintWriter(writer))
+        error_msg = writer.toString//StringEscapeUtils.escapeJava(writer.toString)
+        logger.info(" Inside audit final call - exception message: " + error_msg)
+      }
+      else {
+        // In certain cases script is intentionally killed ex: Hive Insert Failures
+        // In such cases you will get only error message. below line will escape the error message
+        if (error_str != null && error_str != "") {
+          error_msg = error_str//StringEscapeUtils.escapeJava(error_str)
+          logger.info("Inside audit final call - error message: " + error_msg)
         }
       }
-      audit_param_dict = audit_param_dict + ("audit_config" -> audit_config, "env" -> env, "sent_to" -> sent_to, "lits_override" -> lits_override, "ARG_PARTITION_NAME" -> ARG_PARTITION_NAME,
-        "increment_column" -> increment_column, "increment_datatype" -> increment_datatype, "TARGET_TABLE_DATE_FORMAT" -> TARGET_TABLE_DATE_FORMAT, "LH_IND" -> LH_IND, "lits_purge_dt" -> purge_date)
-      audit_param_dict = audit_param_dict+("input_sql"-> Input_Table_query,"target_table" -> Input_Table, "reference_table" -> reference_table, "Customer_ID" -> Customer_ID , "LKP_CUSTOMER_ID" -> LKP_CUSTOMER_ID, "LKP_DB_NAME" -> LKP_DB_NAME, "LKP_TABLE_NAME" -> LKP_TABLE_NAME)
-
-
-      if (audit_int_flg == "true") {
-        val audit_int_flg_returned = getAuditConfigDetails("user_config")
-        audit_int_flg = audit_int_flg_returned
-        //audit_config = audit_config_path_returned
-      }
-      else {// minimal audit integration only when country is nam. To prevent failures in APAC
-        logger.info("Datalens integration flag is false proceeding with minimal integration")
-        audit_param_dict = audit_param_dict + ("audit_config" -> "")
-        audit_int_flg = "true"
-        AuditIntegration.audit_start_call("true")
+      var audit_req_param = audit_param_dict
+      var spark_args = audit_req_param.getOrElse("other_user_provided_arguments", Map[String, String]().empty).asInstanceOf[Map[String, String]]
+      // spark args contans the list of run time arguments passed while running script.
+      spark_args = spark_args.-("pipeline_id")
+      val dataset_name = audit_req_param.getOrElse("target_table", "").toString
+      var database_name = ""
+      var table_name = ""
+      if(dataset_name !="" && dataset_name.contains(".")) {
+        database_name = dataset_name.split("\\.")(0)
+        table_name = dataset_name.split("\\.")(1)
       }
 
-      logger.info("After audit start call ")
-      AuditIntegration.audit_final_call(exit_code, exit_status, err_msg)
-    /*} catch {
-      case ex: Exception =>
-        logger.error(""" Error in Audit call """)
-        logger.error(ex.getStackTrace.mkString("\n"))
-        logger.error(ex.getMessage)
+      var mapping_keys = Map("frameworkName" -> "CPRA_Purge_framework",
+        "frameworkVersion" -> "V2.0.1",
+        "litsPurgeDt" -> audit_req_param.getOrElse("lits_purge_dt", "").toString,
+        "LegalHoldInd" -> audit_req_param.getOrElse("LH_IND", "").toString,
+        //"target_table" -> audit_req_param.getOrElse("target_table", 0).toString,
+        "tgtTblSql" -> StringEscapeUtils.escapeJava(audit_req_param.getOrElse("input_sql", "").toString).replace("\"","").replace("\\",""),
+        "lkpTblRecCnt" -> audit_req_param.getOrElse("ref_tbl_total_count", "").toString,
+        "tgtTblInitialRecCnt" -> audit_req_param.getOrElse("tgt_tbl_initial_count", "").toString,
+        "tgtTblPurgeRecCnt" -> audit_req_param.getOrElse("tgt_tbl_purge_count", "").toString,
+        "tgtTblFinalCount" -> audit_req_param.getOrElse("tgt_tbl_final_count", "").toString,
+        "databaseName" -> database_name,
+        "tableName" -> table_name,
+          "litsOverride" -> audit_req_param.getOrElse("lits_override", "").toString,
+        "lkpDbNAME" -> audit_req_param.getOrElse("LKP_DB_NAME", "").toString,
+        "lkpTblName" -> audit_req_param.getOrElse("LKP_TABLE_NAME", "").toString,
+          "lkpKey" -> audit_req_param.getOrElse("LKP_CUSTOMER_ID", "").toString,
+          "tgtKeyColumn" -> audit_req_param.getOrElse("Customer_ID", "").toString,
+          "tgtPartColNames" -> audit_req_param.getOrElse("ARG_PARTITION_NAME", "").toString,
+          "tgtTblIncrementCol" -> audit_req_param.getOrElse("increment_column", "").toString,
+          "tgtTblIncrementColDtFmt" -> audit_req_param.getOrElse("TARGET_TABLE_DATE_FORMAT", "").toString
+      )
+
+      logger.info("Mapping Keys for Datalens: \n " + mapping_keys.toString())
+
+      val param_dict = Map("edge_node_user_config_file" -> audit_req_param("audit_config").toString,
+        "job_status" -> job_status, "console_log_file_name" -> "N/A", "app_id" -> audit_req_param.getOrElse("appId", "").toString,
+        "env" -> audit_req_param.getOrElse("env", "").toString, "exit_code" -> exit_code, "error_category" -> "N/A",
+        "error_message" -> error_msg, "audit_email" -> audit_req_param.getOrElse("sent_to", "").toString)
+      val spark: SparkSession = audit_req_param("spark").asInstanceOf[SparkSession]
+      val sc: SparkContext = audit_req_param("sc").asInstanceOf[SparkContext]
+      logger.info("Param dict in final call: " + param_dict.mkString(","))
+      AuditFrameworkDriver.endJob(param_dict, mapping_keys, spark, sc)
+      logger.info("After audit final call")
     }
-
-     */
+    catch {
+      case e: Exception =>
+        logger.error("Error occurred while making audit final call from DQ\n"+e.printStackTrace())
+    }
   }
 }
